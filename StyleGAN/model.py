@@ -4,6 +4,9 @@
 import torch
 import torch.nn as nn 
 
+import torch.nn.functional as F
+from utils import get_truncated_noise
+
 class MappingLayers(nn.Module):
     
     '''
@@ -130,7 +133,7 @@ class MicroStyleGANGeneratorBlock(nn.Module):
             self.upsample = nn.Upsample((starting_size), mode = "bilinear")
         self.conv = nn.Conv2d(in_chan, out_chan, kernel_size, padding=1) #Padding is used to maintain the image size 
         self.inject_noise = InjectNoise(out_chan)
-        self.adain = AdaIN(out_chan, w_dim)
+        self.adin = AdaIN(out_chan, w_dim)
         self.activation = nn.LeakyReLU(0.2)
         
         
@@ -155,6 +158,97 @@ class MicroStyleGANGeneratorBlock(nn.Module):
     
     
     
-# just testing here 
+# Mini Stylegan generator 
+
+class MicroStyleGANGenerator(nn.Module):
+    '''
+    Micro StyleGAN Generator Class
+    Values:
+        z_dim: the dimension of the noise vector, a scalar
+        map_hidden_dim: the mapping inner dimension, a scalar
+        w_dim: the dimension of the intermediate noise vector, a scalar
+        in_chan: the dimension of the constant input, usually w_dim, a scalar
+        out_chan: the number of channels wanted in the output, a scalar
+        kernel_size: the size of the convolving kernel
+        hidden_chan: the inner dimension, a scalar
+    '''
+    def __init__(self,
+                 z_dim,
+                 map_hidden_dim,
+                 w_dim,
+                 in_chan,
+                 out_chan,
+                 kernel_size,
+                 hidden_chan):
+        super().__init__()
+        self.map = MappingLayers(z_dim, map_hidden_dim, w_dim)
+        self.starting_constant = nn.Parameter(torch.randn(1, in_chan, 4, 4))
+        self.block0 = MicroStyleGANGeneratorBlock(in_chan, hidden_chan, w_dim, kernel_size, 4, use_upsample = False)
+        self.block1 = MicroStyleGANGeneratorBlock(hidden_chan, hidden_chan, w_dim, kernel_size, 8)
+        self.block2 = MicroStyleGANGeneratorBlock(hidden_chan, hidden_chan, w_dim, kernel_size, 16)
+        # transform to an image 
+        self.block1_to_image = nn.Conv2d(hidden_chan, out_chan, kernel_size=1)
+        self.block2_to_image = nn.Conv2d(hidden_chan, out_chan, kernel_size=1)
+        self.alpha = 0.2
+        
+    def upsample_to_match_size(self, smaller_image, bigger_image):
+        '''
+        Function for upsampling an image to the size of another: Given a two images (smaller and bigger),
+        upsamples the first to have the same dimensions as the second.
+        Parameters:
+            smaller_image: the smaller image to upsample
+            bigger_image: the bigger image whose dimensions will be upsampled to
+        '''
+        return F.interpolate(smaller_image, size = bigger_image.shape[-2:], mode = "bilinear")
+    
+    def forward(self, noise, return_intermediate=False):
+        '''
+        Function for completing a forward pass of MicroStyleGANGenerator: Given noise,
+        computes a StyleGAN iteration.
+        Parameters:
+            noise: a noise tensor with dimensions (n_samples, z_dim)
+            return_intermediate: a boolean, true to return the images as well (for testing) and false otherwise
+        '''
+        x = self.starting_constant
+        w = self.map(noise)
+        x = self.block0(x, w)
+        x_small = self.block1(x, w) #First generator run output
+        x_small_image = self.block1_to_image(x_small)
+        x_big = self.block2(x_small, w) #Second generator run output
+        x_big_image = self.block2_to_image(x_big)
+        x_small_upsample = self.upsample_to_match_size(x_small_image, x_big_image) # Upsample first generator run outputto same size as second generator run output
+        
+        interpolation = self.alpha * (x_big_image) + (1 - self.alpha) * (x_small_upsample)
         
         
+        if return_intermediate:
+            return interpolation, x_small_upsample, x-x_big_image
+        return interpolation
+    
+    def get_self(self):
+        return self;
+        
+        
+    
+        
+z_dim = 128
+out_chan = 3
+truncation = 0.7
+
+mu_stylegan = MicroStyleGANGenerator(
+    z_dim=z_dim,
+    map_hidden_dim=1024,
+    w_dim=496,
+    in_chan=512,
+    out_chan=out_chan,
+    kernel_size=3,
+    hidden_chan=256
+)
+
+test_samples = 10
+test_result = mu_stylegan(get_truncated_noise(test_samples, z_dim, truncation))
+
+# Check if the block works
+assert tuple(test_result.shape) == (test_samples, out_chan, 16, 16)
+
+# Check that the interpolation is correct
